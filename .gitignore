@@ -1,0 +1,10 @@
+# runtime artifacts
+*.log
+photo_ledger.txt
+
+# python
+__pycache__/
+*.pyc
+
+# os
+.DS_Store
