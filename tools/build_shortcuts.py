@@ -204,7 +204,8 @@ def send_to_pixel(limit):
     end_loop = b.repeat_each(out(photos, "Photos"))
     key = b.photo_key()
     end_if = b.if_contains(var("Missing"), out(key, "Text"))
-    encoded = b.add("urlencode", {"WFEncodeMode": "Encode", "WFInput": attach(out(key, "Text"))})
+    encoded = b.add("urlencode", {"WFEncodeMode": "Encode",  # a text field, not a content input
+                                  "WFInput": text(out(key, "Text"))})
     b.put([var("Base"), "/upload?name=", out(encoded, "URL Encoded Text")], var("Repeat Item"))
     end_if()
     end_loop()
