@@ -20,41 +20,16 @@ size:
 
     wait = MIN_WAIT_SEC + (file_size_bits / (UPLOAD_MBPS * 1e6)) * WAIT_SAFETY   (<= MAX_WAIT_SEC)
 
-The wait is measured in online time: while the device is offline the clock does not
-advance, so a file is never deleted immediately after the device reconnects. Clients are
-expected to retain their originals until the cloud copy is confirmed; local deletion here
-is space management, not a backup guarantee.
+A file is deleted only when it is at least `wait` old AND the device has been continuously
+online for at least `wait`; reconnecting restarts that clock. Clients are expected to retain
+their originals until the cloud copy is confirmed; local deletion here is space management,
+not a backup guarantee.
 
-A persistent ledger records every finished name so backed-up-and-deleted files are not
-requested again.
+Every upload is keyed by its identity: the sanitized name with any known media extension
+removed. A persistent ledger records every finished identity so backed-up-and-deleted files
+are not requested again.
 
-Network
--------
-The server binds 0.0.0.0 and is intended to be reached over a private overlay network
-(e.g. Tailscale). It is therefore also reachable on the local LAN. All mutating endpoints
-require a shared secret in the X-Token header; /ping and /exists expose only counts.
-
-Endpoints (all except /ping require header  X-Token: <token>):
-    GET  /ping                            health, buffer and ledger counts
-    GET  /space                           bytes of buffer headroom remaining
-    GET  /exists?name=<name>              "yes" | "no"
-    PUT  /missing        (body: names)    names neither finished nor currently held
-    PUT  /safe_to_delete (body: names)    finished names as |name| (presumed backed up)
-    PUT  /upload?name=<name> (body: file) "saved" | "skipped" | "BUSY"
-
-Configuration (environment variables)
--------------------------------------
-    PHOTO_TOKEN        shared secret, required
-    PHOTO_DEST         destination folder (default: /storage/emulated/0/DCIM/Camera)
-    PHOTO_LEDGER       ledger path (default: ~/photo_ledger.txt)
-    PHOTO_PORT         listen port (default: 8765)
-    PHOTO_UPLOAD_MBPS  assumed upload speed in Mbps (default: 10)
-    PHOTO_MIN_WAIT_SEC minimum hold per file (default: 180)
-    PHOTO_WAIT_SAFETY  multiple of estimated upload time (default: 2.5)
-    PHOTO_MAX_WAIT_SEC upper bound on the hold (default: 43200)
-    MAX_PENDING_MB     buffer cap in MB (default: 12000)
-    CLEAN_EVERY_SEC    cleaner interval (default: 30)
-    PHOTO_FORCE_ONLINE "1" to skip the connectivity probe (testing)
+The HTTP API, configuration variables and security model are documented in README.md.
 """
 
 import hmac
@@ -68,49 +43,75 @@ import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
-DEST_DIR = os.environ.get("PHOTO_DEST", "/storage/emulated/0/DCIM/Camera")
-LEDGER = os.environ.get("PHOTO_LEDGER", os.path.expanduser("~/photo_ledger.txt"))
-TOKEN = os.environ.get("PHOTO_TOKEN", "")
-PORT = int(os.environ.get("PHOTO_PORT", "8765"))
 
-UPLOAD_MBPS = float(os.environ.get("PHOTO_UPLOAD_MBPS", "10"))
-MIN_WAIT_SEC = float(os.environ.get("PHOTO_MIN_WAIT_SEC", "180"))
-WAIT_SAFETY = float(os.environ.get("PHOTO_WAIT_SAFETY", "2.5"))
-MAX_WAIT_SEC = float(os.environ.get("PHOTO_MAX_WAIT_SEC", str(12 * 3600)))
+def _env(name, default, cast=str):
+    return cast(os.environ.get(name, default))
 
-MAX_PENDING_BYTES = float(os.environ.get("MAX_PENDING_MB", "12000")) * 1e6
-CLEAN_EVERY_SEC = int(os.environ.get("CLEAN_EVERY_SEC", "30"))
+
+DEST_DIR = _env("PHOTO_DEST", "/storage/emulated/0/DCIM/Camera")
+LEDGER_PATH = _env("PHOTO_LEDGER", os.path.expanduser("~/photo_ledger.txt"))
+TOKEN = _env("PHOTO_TOKEN", "")
+PORT = _env("PHOTO_PORT", "8765", int)
+
+UPLOAD_MBPS = _env("PHOTO_UPLOAD_MBPS", "10", float)
+MIN_WAIT_SEC = _env("PHOTO_MIN_WAIT_SEC", "180", float)
+WAIT_SAFETY = _env("PHOTO_WAIT_SAFETY", "2.5", float)
+MAX_WAIT_SEC = _env("PHOTO_MAX_WAIT_SEC", str(12 * 3600), float)
+
+MAX_PENDING_BYTES = _env("PHOTO_MAX_PENDING_MB", "12000", float) * 1e6
+CLEAN_EVERY_SEC = _env("PHOTO_CLEAN_EVERY_SEC", "30", float)
+FORCE_ONLINE = _env("PHOTO_FORCE_ONLINE", "") == "1"
+
+PLACEHOLDER_TOKEN = "CHANGE-ME"  # the value shipped in start-server.sh
 CHUNK = 1024 * 1024
+PART_SUFFIX = ".part"
+KNOWN_EXT = {".heic", ".heif", ".jpg", ".jpeg", ".png", ".gif", ".webp", ".dng",
+             ".mov", ".mp4", ".m4v"}
 
-KNOWN_EXT = {".heic", ".heif", ".jpg", ".jpeg", ".png", ".gif", ".mov", ".mp4", ".m4v", ".dng", ".webp"}
 
-_ledger_lock = threading.Lock()
-_seen = set()
+def log(msg, *args):
+    print(msg % args if args else msg, flush=True)
 
-_net_lock = threading.Lock()
-_net = {"at": 0.0, "ok": False, "since": 0.0}
+
+def unlink_quietly(path):
+    try:
+        os.remove(path)
+    except OSError:
+        pass
 
 
 # --- ledger ---------------------------------------------------------------
 
-def load_ledger():
-    if os.path.exists(LEDGER):
-        with open(LEDGER, "r", encoding="utf-8", errors="replace") as f:
-            for line in f:
-                name = line.strip()
-                if name:
-                    _seen.add(name)
+class Ledger:
+    """Append-only, fsync'd set of finished identities."""
 
+    def __init__(self, path):
+        self.path = path
+        self._lock = threading.Lock()
+        self._names = set()
 
-def remember(name):
-    with _ledger_lock:
-        if name in _seen:
-            return
-        _seen.add(name)
-        with open(LEDGER, "a", encoding="utf-8") as f:
-            f.write(name + "\n")
-            f.flush()
-            os.fsync(f.fileno())
+    def load(self):
+        try:
+            with open(self.path, "r", encoding="utf-8", errors="replace") as f:
+                self._names.update(line.strip() for line in f if line.strip())
+        except FileNotFoundError:
+            pass
+
+    def __contains__(self, name):
+        return name in self._names
+
+    def __len__(self):
+        return len(self._names)
+
+    def add(self, name):
+        with self._lock:
+            if name in self._names:
+                return
+            with open(self.path, "a", encoding="utf-8") as f:
+                f.write(name + "\n")
+                f.flush()
+                os.fsync(f.fileno())
+            self._names.add(name)
 
 
 # --- names and types ------------------------------------------------------
@@ -121,9 +122,15 @@ def clean_name(raw):
     return name.strip(". ") or "unnamed"
 
 
-def base_of(fname):
+def strip_media_ext(fname):
     stem, ext = os.path.splitext(fname)
     return stem if ext.lower() in KNOWN_EXT else fname
+
+
+def identity(raw):
+    """The single key used for every ledger and buffer lookup, so that a client name means
+    the same thing on every endpoint whether or not it carries a media extension."""
+    return strip_media_ext(clean_name(raw))
 
 
 def sniff_ext(head):
@@ -133,6 +140,8 @@ def sniff_ext(head):
         return ".png"
     if head[:4] == b"GIF8":
         return ".gif"
+    if head[:4] == b"RIFF" and head[8:12] == b"WEBP":
+        return ".webp"
     if head[4:8] == b"ftyp":
         brand = head[8:12]
         if brand in (b"heic", b"heix", b"hevc", b"heim", b"heis", b"mif1", b"msf1"):
@@ -151,44 +160,59 @@ def media_scan_async(path):
                     ["am", "broadcast", "-a", "android.intent.action.MEDIA_SCANNER_SCAN_FILE",
                      "-d", "file://" + path]):
             try:
-                subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=20)
+                subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                               timeout=20, check=True)
                 return
-            except Exception:
+            except (OSError, subprocess.SubprocessError):
                 continue
+        log("media scan failed for %s", path)
     threading.Thread(target=run, daemon=True).start()
 
 
 # --- connectivity ---------------------------------------------------------
 
-def is_online():
-    """Cached connectivity check. Records when the device most recently came online so the
-    cleaner can require continuous online time rather than wall-clock age."""
-    if os.environ.get("PHOTO_FORCE_ONLINE") == "1":
-        with _net_lock:
-            if not _net["ok"]:
-                _net["ok"] = True
-                _net["since"] = time.time()
+class Connectivity:
+    """Cached connectivity probe that tracks how long the device has been continuously
+    online, so the cleaner can require online time rather than wall-clock age."""
+
+    CACHE_SEC = 30
+    PROBE_ADDR = ("8.8.8.8", 53)
+
+    def __init__(self, force=False):
+        self._force = force
+        self._lock = threading.Lock()
+        self._checked_at = 0.0
+        self._ok = False
+        self._since = 0.0
+
+    def _probe(self):
+        if self._force:
             return True
-    with _net_lock:
-        if time.time() - _net["at"] < 30:
-            return _net["ok"]
-    try:
-        socket.create_connection(("8.8.8.8", 53), timeout=4).close()
-        ok = True
-    except OSError:
-        ok = False
-    now = time.time()
-    with _net_lock:
-        _net["at"] = now
-        if ok and not _net["ok"]:
-            _net["since"] = now
-        _net["ok"] = ok
-    return ok
+        try:
+            socket.create_connection(self.PROBE_ADDR, timeout=4).close()
+            return True
+        except OSError:
+            return False
 
+    def is_online(self):
+        with self._lock:
+            if time.time() - self._checked_at < self.CACHE_SEC:
+                return self._ok
+        ok = self._probe()
+        now = time.time()
+        with self._lock:
+            self._checked_at = now
+            if ok and not self._ok:
+                self._since = now
+            self._ok = ok
+        return ok
 
-def online_since():
-    with _net_lock:
-        return _net["since"]
+    def online_seconds(self):
+        """Seconds continuously online, or None while offline."""
+        if not self.is_online():
+            return None
+        with self._lock:
+            return time.time() - self._since
 
 
 # --- buffer accounting ----------------------------------------------------
@@ -197,17 +221,17 @@ def partial_dir():
     return os.path.join(DEST_DIR, ".partial")
 
 
-def live_files():
+def _scan(directory, keep):
+    """(name, path, stat) for each regular file in `directory` whose name passes `keep`."""
     out = []
     try:
-        for f in os.listdir(DEST_DIR):
-            if f.startswith("."):
-                continue
-            p = os.path.join(DEST_DIR, f)
-            if os.path.isfile(p):
+        with os.scandir(directory) as entries:
+            for e in entries:
+                if not keep(e.name):
+                    continue
                 try:
-                    st = os.stat(p)
-                    out.append((f, p, st.st_size, st.st_mtime))
+                    if e.is_file():
+                        out.append((e.name, e.path, e.stat()))
                 except OSError:
                     pass
     except OSError:
@@ -215,27 +239,27 @@ def live_files():
     return out
 
 
-def partial_bytes():
-    total = 0
-    try:
-        for f in os.listdir(partial_dir()):
-            if f.endswith(".part"):
-                try:
-                    total += os.path.getsize(os.path.join(partial_dir(), f))
-                except OSError:
-                    pass
-    except OSError:
-        pass
-    return total
+def live_files():
+    return _scan(DEST_DIR, lambda n: not n.startswith("."))
+
+
+def partial_files():
+    return _scan(partial_dir(), lambda n: n.endswith(PART_SUFFIX))
 
 
 def pending_bytes():
-    # completed files plus in-flight uploads, so concurrent uploads cannot overrun the cap
-    return sum(sz for _, _, sz, _ in live_files()) + partial_bytes()
+    # completed files plus in-flight uploads, so concurrent uploads count against the cap
+    return sum(st.st_size for _, _, st in live_files() + partial_files())
 
 
 def held_names():
-    return {base_of(f) for f, _, _, _ in live_files()}
+    return {strip_media_ext(n) for n, _, _ in live_files()}
+
+
+def is_known(name, held=None):
+    """True if `name` is finished or currently buffered."""
+    key = identity(name)
+    return key in ledger or key in (held_names() if held is None else held)
 
 
 def wait_for(size_bytes):
@@ -245,39 +269,30 @@ def wait_for(size_bytes):
 
 # --- cleaner --------------------------------------------------------------
 
-def remove_stale_partials():
-    try:
-        for f in os.listdir(partial_dir()):
-            if f.endswith(".part"):
-                try:
-                    os.remove(os.path.join(partial_dir(), f))
-                except OSError:
-                    pass
-    except OSError:
-        pass
+def clean_once():
+    up = net.online_seconds()
+    if up is None:
+        return
+    now = time.time()
+    for fname, path, st in live_files():
+        wait = wait_for(st.st_size)
+        age = now - st.st_mtime
+        if age >= wait and up >= wait:
+            # record first: a crash between the two steps must not lose the ledger entry
+            ledger.add(strip_media_ext(fname))
+            try:
+                os.remove(path)
+            except OSError:
+                continue
+            log("freed %s (held %.0f min, wait %.0f min)", fname, age / 60, wait / 60)
 
 
 def cleaner_loop():
     while True:
         try:
-            if is_online():
-                now = time.time()
-                since = online_since()
-                for fname, path, sz, mtime in live_files():
-                    wait = wait_for(sz)
-                    # eligible only once the file is old enough AND the device has been
-                    # continuously online that long, so Google Photos had time to upload it
-                    if (now - mtime) >= wait and (now - since) >= wait:
-                        name = base_of(fname)
-                        try:
-                            os.remove(path)
-                            remember(name)
-                            print("freed %s (held %.0f min, wait %.0f min)"
-                                  % (fname, (now - mtime) / 60, wait / 60), flush=True)
-                        except OSError:
-                            pass
-        except Exception as exc:
-            print("cleaner error:", exc, flush=True)
+            clean_once()
+        except Exception as exc:  # keep the cleaner alive whatever happens
+            log("cleaner error: %s", exc)
         time.sleep(CLEAN_EVERY_SEC)
 
 
@@ -286,6 +301,8 @@ def cleaner_loop():
 class Handler(BaseHTTPRequestHandler):
     server_version = "pixel-1-sync/1.0"
     protocol_version = "HTTP/1.1"
+
+    # -- plumbing --
 
     def _reply(self, code, text):
         body = (text + "\n").encode()
@@ -298,44 +315,45 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
-    def _authorized(self):
-        if TOKEN and hmac.compare_digest(self.headers.get("X-Token", ""), TOKEN):
-            return True
-        self._reply(401, "bad token")
-        return False
+    def _route(self):
+        return urlparse(self.path).path
+
+    def _dispatch(self, routes):
+        if not (TOKEN and hmac.compare_digest(self.headers.get("X-Token", ""), TOKEN)):
+            return self._reply(401, "bad token")
+        action = routes.get(self._route())
+        if action is None:
+            return self._reply(404, "not found")
+        action()
 
     def _query_name(self):
+        """The sanitized ?name= value, or None after replying with an error."""
         raw = (parse_qs(urlparse(self.path).query).get("name") or [""])[0]
         if not raw:
             self._reply(400, "missing name")
             return None
         return clean_name(raw)
 
+    def _read_exact(self, n):
+        while n > 0:
+            data = self.rfile.read(min(CHUNK, n))
+            if not data:
+                raise IOError("connection closed mid-body")
+            n -= len(data)
+            yield data
+
     def _body_chunks(self):
-        enc = self.headers.get("Transfer-Encoding", "").lower()
-        if enc == "chunked":
-            while True:
-                line = self.rfile.readline()
-                size = int(line.strip().split(b";")[0], 16)
-                if size == 0:
-                    self.rfile.readline()
-                    return
-                remaining = size
-                while remaining:
-                    data = self.rfile.read(min(CHUNK, remaining))
-                    if not data:
-                        raise IOError("connection closed mid-body")
-                    remaining -= len(data)
-                    yield data
-                self.rfile.readline()
-        else:
-            remaining = int(self.headers.get("Content-Length", "0"))
-            while remaining > 0:
-                data = self.rfile.read(min(CHUNK, remaining))
-                if not data:
-                    raise IOError("connection closed mid-body")
-                remaining -= len(data)
-                yield data
+        if self.headers.get("Transfer-Encoding", "").lower() != "chunked":
+            yield from self._read_exact(int(self.headers.get("Content-Length") or 0))
+            return
+        while True:
+            size = int(self.rfile.readline().split(b";")[0].strip(), 16)
+            if size == 0:
+                while self.rfile.readline().strip():  # skip trailers up to the blank line
+                    pass
+                return
+            yield from self._read_exact(size)
+            self.rfile.readline()
 
     def _drain(self):
         try:
@@ -345,7 +363,7 @@ class Handler(BaseHTTPRequestHandler):
             self.close_connection = True
 
     def _read_names(self):
-        """Return the posted newline-separated names, or None after replying with an error."""
+        """The posted newline-separated names, or None after replying with an error."""
         try:
             blob = b"".join(self._body_chunks())
         except (ValueError, IOError):
@@ -353,64 +371,74 @@ class Handler(BaseHTTPRequestHandler):
             return None
         return [n.strip() for n in blob.decode("utf-8", "replace").splitlines() if n.strip()]
 
-    # -- GET --
+    def _reply_names(self, names):
+        self._reply(200, "\n".join(names) if names else "NONE")
+
+    # -- verbs --
 
     def do_GET(self):
-        route = urlparse(self.path).path
-        if route == "/ping":
-            return self._reply(200, "pong (%d done, %d in buffer, %.0f MB, online=%s)"
-                               % (len(_seen), len(live_files()), pending_bytes() / 1e6, is_online()))
-        if not self._authorized():
-            return
-        if route == "/space":
-            return self._reply(200, str(int(max(0, MAX_PENDING_BYTES - pending_bytes()))))
-        if route == "/exists":
-            name = self._query_name()
-            if name is not None:
-                self._reply(200, "yes" if (name in _seen or name in held_names()) else "no")
-            return
-        self._reply(404, "not found")
-
-    # -- PUT / POST --
+        if self._route() == "/ping":
+            return self._ping()
+        self._dispatch({"/space": self._space, "/exists": self._exists})
 
     def do_PUT(self):
-        route = urlparse(self.path).path
-        if route in ("/missing", "/safe_to_delete"):
-            if not self._authorized():
-                return
-            names = self._read_names()
-            if names is None:
-                return
-            if route == "/missing":
-                seen, held = _seen, held_names()
-                missing = [n for n in names if clean_name(n) not in seen and clean_name(n) not in held]
-                self.log_message("missing: %d asked, %d missing", len(names), len(missing))
-                return self._reply(200, "\n".join(missing) if missing else "NONE")
-            safe = ["|%s|" % n for n in names if clean_name(n) in _seen]
-            self.log_message("safe_to_delete: %d of %d", len(safe), len(names))
-            return self._reply(200, "\n".join(safe) if safe else "NONE")
+        self._dispatch({"/missing": self._missing,
+                        "/safe_to_delete": self._safe_to_delete,
+                        "/upload": self._upload})
 
-        if route != "/upload":
-            return self._reply(404, "not found")
-        if not self._authorized():
+    do_POST = do_PUT
+
+    # -- endpoints --
+
+    def _ping(self):
+        self._reply(200, "pong (%d done, %d in buffer, %.0f MB, online=%s)"
+                    % (len(ledger), len(live_files()), pending_bytes() / 1e6, net.is_online()))
+
+    def _space(self):
+        self._reply(200, str(int(max(0, MAX_PENDING_BYTES - pending_bytes()))))
+
+    def _exists(self):
+        name = self._query_name()
+        if name is not None:
+            self._reply(200, "yes" if is_known(name) else "no")
+
+    def _missing(self):
+        names = self._read_names()
+        if names is None:
             return
+        held = held_names()
+        missing = [n for n in names if not is_known(n, held)]
+        self.log_message("missing: %d asked, %d missing", len(names), len(missing))
+        self._reply_names(missing)
+
+    def _safe_to_delete(self):
+        names = self._read_names()
+        if names is None:
+            return
+        safe = ["|%s|" % n for n in names if identity(n) in ledger]
+        self.log_message("safe_to_delete: %d of %d", len(safe), len(names))
+        self._reply_names(safe)
+
+    def _upload(self):
         name = self._query_name()
         if name is None:
             return
-
-        if name in _seen or name in held_names():
+        if is_known(name):
             self._drain()
             return self._reply(200, "skipped")
 
-        if pending_bytes() >= MAX_PENDING_BYTES:
+        try:
+            incoming = int(self.headers.get("Content-Length") or 0)  # 0 if chunked
+        except ValueError:
+            return self._reply(400, "bad content-length")
+        if incoming > MAX_PENDING_BYTES:
+            return self._reply(413, "file larger than the buffer (PHOTO_MAX_PENDING_MB)")
+        if pending_bytes() + incoming > MAX_PENDING_BYTES:
             self._drain()
             return self._reply(200, "BUSY")
 
-        os.makedirs(partial_dir(), exist_ok=True)
-        open(os.path.join(partial_dir(), ".nomedia"), "a").close()
         # unique temp name so concurrent uploads of the same name cannot collide
-        tmp = os.path.join(partial_dir(), "%s.%s.part" % (name, os.urandom(6).hex()))
-
+        tmp = os.path.join(partial_dir(), "%s.%s%s" % (name, os.urandom(6).hex(), PART_SUFFIX))
         head, total = b"", 0
         try:
             with open(tmp, "wb") as f:
@@ -422,46 +450,51 @@ class Handler(BaseHTTPRequestHandler):
                 f.flush()
                 os.fsync(f.fileno())
         except (ValueError, IOError) as exc:
-            self._safe_unlink(tmp)
+            unlink_quietly(tmp)
             return self._reply(400, "bad upload: %s" % exc)
         except Exception as exc:
-            self._safe_unlink(tmp)
+            unlink_quietly(tmp)
             return self._reply(500, "upload failed: %s" % exc)
 
         if total == 0:
-            self._safe_unlink(tmp)
+            unlink_quietly(tmp)
             return self._reply(400, "empty upload")
 
         final_name = name
         if os.path.splitext(name)[1].lower() not in KNOWN_EXT:
-            final_name = name + (sniff_ext(head) or "")
+            ext = sniff_ext(head)
+            if not ext:
+                # Google Photos would ignore it, yet the cleaner would later mark it finished
+                unlink_quietly(tmp)
+                return self._reply(415, "unrecognized media type")
+            final_name += ext
         final_path = os.path.join(DEST_DIR, final_name)
         os.replace(tmp, final_path)
         media_scan_async(final_path)
-        self.log_message("saved %s (%d bytes), buffer %.0f MB", final_name, total, pending_bytes() / 1e6)
+        self.log_message("saved %s (%d bytes), buffer %.0f MB",
+                         final_name, total, pending_bytes() / 1e6)
         self._reply(200, "saved")
 
-    do_POST = do_PUT
 
-    @staticmethod
-    def _safe_unlink(path):
-        try:
-            os.remove(path)
-        except OSError:
-            pass
+ledger = Ledger(LEDGER_PATH)
+net = Connectivity(force=FORCE_ONLINE)
+
+
+def prepare_dirs():
+    os.makedirs(partial_dir(), exist_ok=True)
+    open(os.path.join(partial_dir(), ".nomedia"), "a").close()
+    for _, path, _ in partial_files():  # left behind by an interrupted run
+        unlink_quietly(path)
 
 
 def main():
-    if not TOKEN:
-        sys.exit("PHOTO_TOKEN is required (export PHOTO_TOKEN=<a long random string>)")
-    os.makedirs(DEST_DIR, exist_ok=True)
-    os.makedirs(partial_dir(), exist_ok=True)
-    remove_stale_partials()
-    load_ledger()
+    if not TOKEN or TOKEN == PLACEHOLDER_TOKEN:
+        sys.exit("PHOTO_TOKEN must be set to a long random secret (not %r)" % PLACEHOLDER_TOKEN)
+    prepare_dirs()
+    ledger.load()
     threading.Thread(target=cleaner_loop, daemon=True).start()
-    print("dest=%s ledger=%s port=%d up=%.0fMbps min_wait=%.0fs cap=%.0fMB done=%d"
-          % (DEST_DIR, LEDGER, PORT, UPLOAD_MBPS, MIN_WAIT_SEC, MAX_PENDING_BYTES / 1e6, len(_seen)),
-          flush=True)
+    log("dest=%s ledger=%s port=%d up=%.0fMbps min_wait=%.0fs cap=%.0fMB done=%d",
+        DEST_DIR, LEDGER_PATH, PORT, UPLOAD_MBPS, MIN_WAIT_SEC, MAX_PENDING_BYTES / 1e6, len(ledger))
     ThreadingHTTPServer(("0.0.0.0", PORT), Handler).serve_forever()
 
 

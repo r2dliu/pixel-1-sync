@@ -47,9 +47,10 @@ file's size:
 wait = MIN_WAIT_SEC + (file_size_bits / (UPLOAD_MBPS × 1e6)) × WAIT_SAFETY   (capped at MAX_WAIT_SEC)
 ```
 
-Small files clear quickly; large videos are held proportionally longer. The wait is measured in
-online time — while the device is offline the clock does not advance — so a file is never deleted
-immediately after the device reconnects, before Google Photos has had a chance to upload it.
+Small files clear quickly; large videos are held proportionally longer. A file is deleted only once
+it is at least `wait` old **and** the device has been continuously online for at least `wait`;
+reconnecting restarts that clock, so a file is never deleted immediately after the device
+reconnects, before Google Photos has had a chance to upload it.
 
 This is a time-based heuristic, not a backup guarantee. The source device should retain its
 originals until the cloud copy is confirmed; local deletion on the Pixel is space management only.
@@ -73,7 +74,7 @@ Edit `~/.termux/boot/start-server.sh`:
 
 - `PHOTO_TOKEN` — a long random secret (`head -c 24 /dev/urandom | base64`); the client uses the same value.
 - `PHOTO_UPLOAD_MBPS` — the network's actual upload speed in Mbps (conservative).
-- `MAX_PENDING_MB` — buffer cap; keep below free space and above the largest single file.
+- `PHOTO_MAX_PENDING_MB` — buffer cap; keep below free space and above the largest single file.
 
 Start it and verify:
 
@@ -97,7 +98,7 @@ automatically. Any client that speaks the HTTP API below works equally well.
 
 ## HTTP API
 
-All endpoints except `/ping` require the `X-Token` header.
+All endpoints except `/ping` require the `X-Token` header. The `PUT` endpoints also accept `POST`.
 
 | Method & path | Body | Response |
 |---------------|------|----------|
@@ -106,11 +107,12 @@ All endpoints except `/ping` require the `X-Token` header.
 | `GET /exists?name=<n>` | — | `yes` / `no` |
 | `PUT /missing` | names, one per line | names not finished and not currently held, or `NONE` |
 | `PUT /safe_to_delete` | names, one per line | finished names as `\|name\|`, or `NONE` |
-| `PUT /upload?name=<n>` | file bytes | `saved` / `skipped` / `BUSY` |
+| `PUT /upload?name=<n>` | file bytes | `saved` / `skipped` / `BUSY`; `413` if larger than the buffer, `415` if not a recognized photo or video |
 
 A typical client first posts the batch of candidate names to `/missing`, then `PUT`s only the
 returned files to `/upload`, naming each one stably (for example `creationDate_fileSize`) so
-re-runs are idempotent. The server appends every completed name to a ledger, so files that have
+re-runs are idempotent. Names are compared by *identity*: sanitized, with any known media
+extension removed, so `IMG_1.HEIC` and `IMG_1` refer to the same item. The server appends every completed name to a ledger, so files that have
 been backed up and removed are never requested again.
 
 ## Configuration
@@ -125,8 +127,15 @@ been backed up and removed are never requested again.
 | `PHOTO_MIN_WAIT_SEC` | `180` | minimum hold per file |
 | `PHOTO_WAIT_SAFETY` | `2.5` | multiple of estimated upload time |
 | `PHOTO_MAX_WAIT_SEC` | `43200` | upper bound on the hold |
-| `MAX_PENDING_MB` | `12000` | buffer cap (MB) |
-| `CLEAN_EVERY_SEC` | `30` | cleaner interval |
+| `PHOTO_MAX_PENDING_MB` | `12000` | buffer cap (MB) |
+| `PHOTO_CLEAN_EVERY_SEC` | `30` | cleaner interval (s) |
+| `PHOTO_FORCE_ONLINE` | — | `1` skips the connectivity probe (testing) |
+
+## Development
+
+```sh
+python -m unittest discover tests
+```
 
 ## Monitoring
 
@@ -138,23 +147,28 @@ without the launcher restarting, is offline, or is powered down.
 ## Large initial import
 
 The buffer cannot overflow — excess simply waits and uploads over subsequent runs, paced by the
-upload link. To accelerate a one-time import, raise `MAX_PENDING_MB` toward free space and run the
+upload link. To accelerate a one-time import, raise `PHOTO_MAX_PENDING_MB` toward free space and run the
 client in the foreground. Because the hold scales with file size, the buffer drains about as fast
 as each file can upload, so upload bandwidth, not the cleaner, is the limit.
 
 ## Security
 
 The server binds `0.0.0.0` and is intended to be reached over a private overlay network such as
-Tailscale, which also encrypts the traffic. It is therefore also reachable on the local LAN. All
-mutating endpoints require the `X-Token` secret, compared in constant time; `/ping` and `/exists`
-expose only counts. Run it only on a trusted network.
+Tailscale, which also encrypts the traffic. It is therefore also reachable on the local LAN. Every
+endpoint except `/ping` requires the `X-Token` secret, compared in constant time; `/ping` exposes
+only counts. Run it only on a trusted network.
 
 ## Limitations
 
 - **Backup is not verified.** Deletion is a size- and time-based heuristic. The source device's
   originals are the backstop; confirm the cloud before deleting them.
 - **Live Photos** are relayed as the still image only.
-- **One file must fit the buffer.** `MAX_PENDING_MB` must exceed the largest single file.
+- **One file must fit the buffer.** `PHOTO_MAX_PENDING_MB` must exceed the largest single file;
+  larger uploads are rejected with `413`.
+- **The cleaner manages the whole destination folder.** Every non-hidden file in `PHOTO_DEST` is
+  subject to deletion, including photos taken with the Pixel's own camera when `PHOTO_DEST` is the
+  Camera folder. Don't use the Pixel as a camera, or point `PHOTO_DEST` at a dedicated folder that
+  Google Photos backs up.
 - **Carrier-locked devices.** The storage benefit requires a first-generation Pixel; relaying from
   the Camera folder needs only a working device, not an unlocked bootloader. A rooted device with an
   unlocked bootloader enables a stronger variant — mounting external storage as internal and reading
