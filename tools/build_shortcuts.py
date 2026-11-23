@@ -33,6 +33,12 @@ def out(action, name):
     return {"Type": "ActionOutput", "OutputUUID": action["UUID"], "OutputName": name}
 
 
+def as_text(ref):
+    """The same reference, coerced to Text (needed before text conditions such as contains)."""
+    return dict(ref, Aggrandizements=[{"Type": "WFCoercionVariableAggrandizement",
+                                       "CoercionItemClass": "WFStringContentItem"}])
+
+
 def attach(ref):
     return {"Value": ref, "WFSerializationType": "WFTextTokenAttachment"}
 
@@ -120,7 +126,9 @@ class Builder:
         }))
 
     def if_contains(self, haystack_ref, needle_ref):
-        return self._if(haystack_ref, 99, WFConditionalActionString=text(needle_ref))  # contains
+        # a server response is a file to Shortcuts, which offers only "has any value" for it
+        return self._if(as_text(haystack_ref), 99,  # contains
+                        WFConditionalActionString=text(needle_ref))
 
     def if_has_value(self, ref):
         return self._if(ref, 100)  # has any value
