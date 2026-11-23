@@ -133,6 +133,13 @@ class Builder:
     def if_has_value(self, ref):
         return self._if(ref, 100)  # has any value
 
+    def notify_status(self, title):
+        """Notification showing the server's /ping summary (done count, buffer size)."""
+        ping = self.add("downloadurl", {"WFURL": text(var("Base"), "/ping"), "WFHTTPMethod": "GET"})
+        self.add("notification", {"WFNotificationActionTitle": text(title),
+                                  "WFNotificationActionBody": text(out(ping, "Contents of URL")),
+                                  "WFNotificationActionSound": True}, output=False)
+
     def put(self, url_parts, body_ref):
         return self.add("downloadurl", {
             "WFURL": text(*url_parts),
@@ -209,6 +216,7 @@ def send_to_pixel(limit):
     b.put([var("Base"), "/upload?name=", out(encoded, "URL Encoded Text")], var("Repeat Item"))
     end_if()
     end_loop()
+    b.notify_status("Send to Pixel finished")
     return workflow(b.actions, glyph=59446, color=4282601983)
 
 
