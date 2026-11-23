@@ -96,6 +96,19 @@ Then:
 See [`docs/iphone-shortcut.md`](docs/iphone-shortcut.md) for an iOS Shortcut that uploads new photos
 automatically. Any client that speaks the HTTP API below works equally well.
 
+### iPhone permissions
+
+If a shortcut fails with *"This action is trying to share … Photos items, which is not allowed"*,
+iOS is blocking photo data (including names derived from photos) from leaving the device. Allow it:
+
+1. **Settings → Apps → Shortcuts → Advanced** (older iOS: **Settings → Shortcuts → Advanced**):
+   turn on **Allow Sharing Large Amounts of Data**. Pass 1 sends every photo's name in one request.
+2. **Settings → Privacy & Security → Photos → Shortcuts**: choose **Full Access**. With *Limited*,
+   Find Photos sees only the photos you picked.
+3. Run the shortcut again and answer **Always Allow** when it asks to send items to the Pixel's
+   address. If you previously chose *Don't Allow*, open the shortcut, tap **ⓘ → Privacy**, and
+   reset or allow that address.
+
 ## HTTP API
 
 All endpoints except `/ping` require the `X-Token` header. The `PUT` endpoints also accept `POST`.
