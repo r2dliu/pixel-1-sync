@@ -155,6 +155,8 @@ def sniff_ext(head):
 # --- media scan (asynchronous; never blocks the request) ------------------
 
 def media_scan_async(path):
+    """Ask Android to (re)index `path`. Scanning a deleted path drops its stale entry, which
+    otherwise keeps showing in Google Photos as a photo "on this phone"."""
     def run():
         for cmd in (["termux-media-scan", path],
                     ["am", "broadcast", "-a", "android.intent.action.MEDIA_SCANNER_SCAN_FILE",
@@ -284,6 +286,7 @@ def clean_once():
                 os.remove(path)
             except OSError:
                 continue
+            media_scan_async(path)
             log("freed %s (held %.0f min, wait %.0f min)", fname, age / 60, wait / 60)
 
 

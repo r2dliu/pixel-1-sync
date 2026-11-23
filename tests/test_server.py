@@ -25,7 +25,8 @@ class ServerTest(unittest.TestCase):
         srv.MIN_WAIT_SEC = 0
         srv.ledger = srv.Ledger(os.path.join(self.tmp.name, "ledger.txt"))
         srv.net = srv.Connectivity(force=True)
-        srv.media_scan_async = lambda path: None
+        self.scanned = []
+        srv.media_scan_async = self.scanned.append
         srv.prepare_dirs()
         srv.Handler.log_message = lambda *a: None
         self.httpd = ThreadingHTTPServer(("127.0.0.1", 0), srv.Handler)
@@ -83,6 +84,14 @@ class ServerTest(unittest.TestCase):
         self.assertEqual(self.request("PUT", "/safe_to_delete", b"IMG_2.HEIC\n"),
                          (200, "|IMG_2.HEIC|"))
         self.assertEqual(self.upload("IMG_2.HEIC"), (200, "skipped"))
+
+    def test_freeing_a_file_reindexes_its_path(self):
+        self.upload("gone")
+        path = os.path.join(srv.DEST_DIR, "gone.jpg")
+        self.age_buffer(60)
+        srv.clean_once()
+        self.assertFalse(os.path.exists(path))
+        self.assertEqual(self.scanned, [path, path])  # once on save, once after deletion
 
     def test_unrecognized_media_is_rejected(self):
         self.assertEqual(self.upload("notes", b"just some text")[0], 415)
