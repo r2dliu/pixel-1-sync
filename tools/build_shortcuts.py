@@ -94,15 +94,14 @@ class Builder:
         return self.add("properties.images", {"WFContentItemPropertyName": prop,
                                                "WFInput": attach(ref)})
 
-    def photo_key(self, *wrap):
+    def photo_key(self):
         """Text action holding `[Name]_[yyyyMMdd_HHmmss]` for the current Repeat Item."""
         name = self.detail("Name", var("Repeat Item"))
         created = self.detail("Creation Date", var("Repeat Item"))
         stamp = self.add("format.date", {"WFDateFormatStyle": "Custom",
                                          "WFDateFormat": "yyyyMMdd_HHmmss",
                                          "WFDate": text(out(created, "Creation Date"))})
-        prefix, suffix = (wrap or ("", ""))
-        return self.text(prefix, out(name, "Name"), "_", out(stamp, "Formatted Date"), suffix)
+        return self.text(out(name, "Name"), "_", out(stamp, "Formatted Date"))
 
     def block(self, ident, start_params):
         """Start a control-flow block; returns a function that closes it."""
@@ -128,7 +127,7 @@ class Builder:
     def if_contains(self, haystack_ref, needle_ref):
         # a server response is a file to Shortcuts, which offers only "has any value" for it
         return self._if(as_text(haystack_ref), 99,  # contains
-                        WFConditionalActionString=text(needle_ref))
+                        WFConditionalActionString=text(needle_ref))  # variable or literal
 
     def if_has_value(self, ref):
         return self._if(ref, 100)  # has any value
@@ -140,10 +139,11 @@ class Builder:
                                   "WFNotificationActionBody": text(out(ping, "Contents of URL")),
                                   "WFNotificationActionSound": True}, output=False)
 
-    def put(self, url_parts, body_ref):
-        return self.add("downloadurl", {
+    def request(self, method, url_parts, body_ref=None):
+        """Authenticated request to the server; returns the action (output "Contents of URL")."""
+        params = {
             "WFURL": text(*url_parts),
-            "WFHTTPMethod": "PUT",
+            "WFHTTPMethod": method,
             "ShowHeaders": True,
             "WFHTTPHeaders": {
                 "Value": {"WFDictionaryFieldValueItems": [{
@@ -153,25 +153,15 @@ class Builder:
                 }]},
                 "WFSerializationType": "WFDictionaryFieldValue",
             },
-            "WFHTTPBodyType": "File",
-            "WFRequestVariable": attach(body_ref),
-        })
+        }
+        if body_ref is not None:
+            params.update(WFHTTPBodyType="File", WFRequestVariable=attach(body_ref))
+        return self.add("downloadurl", params)
 
     def config(self):
         """Base and Token variables, filled in by import questions (actions 0 and 2)."""
         self.set_var("Base", out(self.text("http://PIXEL_ADDRESS:8765"), "Text"))
         self.set_var("Token", out(self.text("TOKEN"), "Text"))
-
-    def post_names(self, photos, endpoint, list_var):
-        """Pass 1: send every photo's key to `endpoint`; returns the response action."""
-        end = self.repeat_each(out(photos, "Photos"))
-        self.append_var("NameList", out(self.photo_key(), "Text"))
-        end()
-        combined = self.add("text.combine", {"text": attach(var("NameList")),
-                                             "WFTextSeparator": "New Lines"})
-        response = self.put([var("Base"), endpoint], out(combined, "Combined Text"))
-        self.set_var(list_var, out(response, "Contents of URL"))
-        return response
 
 
 IMPORT_QUESTIONS = [
@@ -202,18 +192,18 @@ def workflow(actions, glyph, color):
 # --- the two shortcuts ----------------------------------------------------
 
 def send_to_pixel(limit):
+    """One photo at a time: ask /exists, upload only if the answer is "no"."""
     b = Builder()
     b.config()
     photos = b.find_photos(limit)
-    b.post_names(photos, "/missing", "Missing")
-    # "contains" on the response text can over-match (a short name inside a longer one);
-    # that only causes an extra upload, which the server answers with "skipped".
     end_loop = b.repeat_each(out(photos, "Photos"))
     key = b.photo_key()
-    end_if = b.if_contains(var("Missing"), out(key, "Text"))
     encoded = b.add("urlencode", {"WFEncodeMode": "Encode",  # a text field, not a content input
                                   "WFInput": text(out(key, "Text"))})
-    b.put([var("Base"), "/upload?name=", out(encoded, "URL Encoded Text")], var("Repeat Item"))
+    name = out(encoded, "URL Encoded Text")
+    exists = b.request("GET", [var("Base"), "/exists?name=", name])
+    end_if = b.if_contains(out(exists, "Contents of URL"), "no")  # reply is "yes" or "no"
+    b.request("PUT", [var("Base"), "/upload?name=", name], var("Repeat Item"))
     end_if()
     end_loop()
     b.notify_status("Send to Pixel finished")
@@ -221,13 +211,14 @@ def send_to_pixel(limit):
 
 
 def delete_backed_up(limit):
+    """One photo at a time: ask /safe_to_delete (finished only, not merely buffered)."""
     b = Builder()
     b.config()
     photos = b.find_photos(limit)
-    b.post_names(photos, "/safe_to_delete", "Safe")
     end_loop = b.repeat_each(out(photos, "Photos"))
-    key = b.photo_key("|", "|")  # the server wraps names as |name| so matches are exact
-    end_if = b.if_contains(var("Safe"), out(key, "Text"))
+    key = b.photo_key()
+    safe = b.request("PUT", [var("Base"), "/safe_to_delete"], out(key, "Text"))
+    end_if = b.if_contains(out(safe, "Contents of URL"), "|")  # "|name|" if finished, else "NONE"
     b.append_var("ToDelete", var("Repeat Item"))
     end_if()
     end_loop()

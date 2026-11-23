@@ -1,9 +1,10 @@
 # iOS Shortcut client
 
-An iOS Shortcut that uploads new photos and videos to a `pixel-1-sync` server. It runs in two
-passes: first it asks the server which items are missing, then it uploads only those. Files that
-hit a full buffer return `BUSY` and are retried on a later run, so progress is resumable and
-idempotent.
+An iOS Shortcut that uploads new photos and videos to a `pixel-1-sync` server. It goes through
+the photos one at a time: it asks the server whether it already has each one and uploads it only
+if not. Files that hit a full buffer return `BUSY` and are retried on a later run, so progress is
+resumable and idempotent. Sending one name per request also keeps every request under iOS's limit
+on sharing photo data.
 
 ## Prerequisites
 
@@ -20,7 +21,7 @@ Create a shortcut named **Send to Pixel**.
 1. **Text** `http://PIXEL_ADDRESS:8765` → **Set Variable** `Base`
 2. **Text** `TOKEN` → **Set Variable** `Token`
 
-### Pass 1 — determine what is missing
+### Loop over the photos
 
 3. **Find Photos** — no filter; Sort by *Creation Date*, **Latest First**; **Limit** on, **500**
    photos. (A date filter such as *is in the last 30 days* is unreliable in Shortcuts.)
@@ -29,27 +30,14 @@ Create a shortcut named **Send to Pixel**.
    - **Get Details of Images** → **Creation Date**
    - **Format Date** → that date, Format **Custom** `yyyyMMdd_HHmmss`
    - **Text** → `[Name]_[Formatted Date]`
-   - **Add to Variable** `NameList`
-5. **Combine Text** → `NameList`, separated by **New Lines**
-6. **Get Contents of URL** → `[Base]/missing`
-   - Method **PUT**; Header `X-Token` = `[Token]`; Request Body **File** = the combined text
-7. **Set Variable** `Missing` = Contents of URL
-
-### Pass 2 — upload the missing items
-
-8. **Repeat with Each** — set the input to the **Find Photos** result from step 3:
-    - **Get Details of Images** → **Name**
-    - **Get Details of Images** → **Creation Date**
-    - **Format Date** → that date, Format **Custom** `yyyyMMdd_HHmmss`
-    - **Text** → `[Name]_[Formatted Date]`
-    - **If** `Missing` **contains** that **Text**:
-      - **URL Encode** that **Text**
-      - **Get Contents of URL** → `[Base]/upload?name=[URL Encoded Text]`
-        - Method **PUT**; Header `X-Token` = `[Token]`; Request Body **File** = **Repeat Item**
-
-A "contains" match can occasionally hit one name inside a longer one. That only causes an extra
-upload, which the server answers with `skipped`. When nothing is missing the response is `NONE`
-and pass 2 uploads nothing.
+   - **URL Encode** that **Text**
+   - **Get Contents of URL** → `[Base]/exists?name=[URL Encoded Text]`
+     - Method **GET**; Header `X-Token` = `[Token]`
+   - **If** Contents of URL (as **Text**) **contains** `no`:
+     - **Get Contents of URL** → `[Base]/upload?name=[URL Encoded Text]`
+       - Method **PUT**; Header `X-Token` = `[Token]`; Request Body **File** = **Repeat Item**
+5. After the loop: **Get Contents of URL** → `[Base]/ping`, then **Show Notification** with its
+   contents, so you can tell when the run has finished.
 
 `tools/build_shortcuts.py` generates this shortcut (and the deletion one below) as files; see its
 header for how to sign and import them.
@@ -78,7 +66,8 @@ a new name and be uploaded once more. That costs bandwidth, never a photo.
 
 `PUT /safe_to_delete` returns the names the server has finished, wrapped as `|name|`. These are
 *presumed* backed up (time-based, not verified), so confirm the cloud before relying on it. A
-second shortcut can build the same names, post them to `/safe_to_delete`, collect the photos whose
-`|name|` appears in the response, and pass them to **Delete Photos**. The generated **Delete
+second shortcut can build the same names, post each one to `/safe_to_delete`, collect the photos
+whose response contains `|` (it is `NONE` otherwise), and pass them to **Delete Photos**. Use
+`/safe_to_delete`, not `/exists`: `/exists` also says `yes` for files still waiting in the buffer. The generated **Delete
 Backed-Up Photos** does this over the whole library (no Limit), so run it by hand. iOS asks for
 confirmation and retains deleted items in Recently Deleted for 30 days.
