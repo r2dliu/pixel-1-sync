@@ -23,8 +23,20 @@ export PHOTO_WAIT_SAFETY="2.5"
 
 export PHOTO_MAX_PENDING_MB="12000"
 
+LOG="$HOME/pixel_sync_server.log"
+MAX_LOG_KB=5000
+
+# Rotate the log: past MAX_LOG_KB, keep one previous copy and empty the current file.
+# Copy-then-truncate is safe while the server runs because it only ever appends.
+while true; do
+  if [ -f "$LOG" ] && [ "$(du -k "$LOG" | cut -f1)" -gt "$MAX_LOG_KB" ]; then
+    cp "$LOG" "$LOG.1" && : > "$LOG"
+  fi
+  sleep 600
+done &
+
 # Restart the server automatically if it exits.
 while true; do
-  python "$HOME/pixel_sync_server.py" >> "$HOME/pixel_sync_server.log" 2>&1
+  python "$HOME/pixel_sync_server.py" >> "$LOG" 2>&1
   sleep 5
 done
