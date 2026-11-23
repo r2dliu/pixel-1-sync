@@ -74,25 +74,15 @@ class Builder:
     def append_var(self, name, ref):
         self.add("appendvariable", {"WFVariableName": name, "WFInput": attach(ref)}, output=False)
 
-    def find_recent_photos(self, days):
-        return self.add("filter.photos", {
-            "WFContentItemFilter": {
-                "Value": {
-                    "WFActionParameterFilterPrefix": 1,
-                    "WFContentPredicateBoundedDate": False,
-                    "WFActionParameterFilterTemplates": [{
-                        "Property": "Creation Date",
-                        "Operator": 1002,  # is in the last
-                        "Removable": True,
-                        "Values": {"Number": days, "Unit": 16},  # 16 = days
-                    }],
-                },
-                "WFSerializationType": "WFContentPredicateTableTemplate",
-            },
-            "WFContentItemSortProperty": "Creation Date",
-            "WFContentItemSortOrder": "Oldest First",
-            "WFContentItemLimitEnabled": False,
-        })
+    def find_photos(self, limit=None):
+        """Newest photos first, optionally only the `limit` most recent. No date filter:
+        Shortcuts' "is in the last" filter is unreliable and its encoding undocumented."""
+        params = {"WFContentItemSortProperty": "Creation Date",
+                  "WFContentItemSortOrder": "Latest First",
+                  "WFContentItemLimitEnabled": limit is not None}
+        if limit is not None:
+            params["WFContentItemLimitNumber"] = limit
+        return self.add("filter.photos", params)
 
     def detail(self, prop, ref):
         return self.add("properties.images", {"WFContentItemPropertyName": prop,
@@ -192,10 +182,10 @@ def workflow(actions, glyph, color):
 
 # --- the two shortcuts ----------------------------------------------------
 
-def send_to_pixel(days):
+def send_to_pixel(limit):
     b = Builder()
     b.config()
-    photos = b.find_recent_photos(days)
+    photos = b.find_photos(limit)
     b.post_names(photos, "/missing", "Missing")
     # "contains" on the response text can over-match (a short name inside a longer one);
     # that only causes an extra upload, which the server answers with "skipped".
@@ -209,10 +199,10 @@ def send_to_pixel(days):
     return workflow(b.actions, glyph=59446, color=4282601983)
 
 
-def delete_backed_up(days):
+def delete_backed_up(limit):
     b = Builder()
     b.config()
-    photos = b.find_recent_photos(days)
+    photos = b.find_photos(limit)
     b.post_names(photos, "/safe_to_delete", "Safe")
     end_loop = b.repeat_each(out(photos, "Photos"))
     key = b.photo_key("|", "|")  # the server wraps names as |name| so matches are exact
@@ -252,11 +242,17 @@ def check(wf):
     assert not open_groups, "unclosed block"
 
 
+RECENT = 500  # photos the automatic run checks each time
+
+
 def main():
     out_dir = sys.argv[1] if len(sys.argv) > 1 else "."
     os.makedirs(out_dir, exist_ok=True)
-    for title, wf in (("Send to Pixel", send_to_pixel(30)),
-                      ("Delete Backed-Up Photos", delete_backed_up(30))):
+    # The automatic run looks only at recent photos so it finishes within iOS's time limit;
+    # the other two are meant to be run by hand, in the foreground, over the whole library.
+    for title, wf in (("Send to Pixel", send_to_pixel(RECENT)),
+                      ("Send All to Pixel", send_to_pixel(None)),
+                      ("Delete Backed-Up Photos", delete_backed_up(None))):
         check(wf)
         path = os.path.join(out_dir, title + ".shortcut")
         with open(path, "wb") as f:

@@ -22,8 +22,8 @@ Create a shortcut named **Send to Pixel**.
 
 ### Pass 1 — determine what is missing
 
-3. **Find Photos** — Filter: *Creation Date is in the last 30 Days*; Sort by *Creation Date*,
-   **Oldest First**; Limit off.
+3. **Find Photos** — no filter; Sort by *Creation Date*, **Latest First**; **Limit** on, **500**
+   photos. (A date filter such as *is in the last 30 days* is unreliable in Shortcuts.)
 4. **Repeat with Each** (Photos):
    - **Get Details of Images** → **Name**
    - **Get Details of Images** → **Creation Date**
@@ -59,9 +59,10 @@ header for how to sign and import them.
 Shortcuts → **Automation** → **Charger → Is Connected → Run Immediately** (disable "Notify When
 Run") → **Run Shortcut → Send to Pixel**. Optionally add a **Time of Day** automation as well.
 
-iOS limits background execution time, so a large first import may stop partway; the next run's
-`/missing` call resumes where it left off. For a large import, run the shortcut in the foreground
-with the device on power.
+iOS limits background execution time, which is why this shortcut checks only the 500 newest
+photos. For the first import, use a copy with **Limit** turned off (the generator builds it as
+**Send All to Pixel**) and run it by hand, in the foreground, with the device on power. Run it
+again until nothing more uploads; each run's `/missing` call resumes where the last stopped.
 
 ## Naming
 
@@ -78,5 +79,6 @@ a new name and be uploaded once more. That costs bandwidth, never a photo.
 `PUT /safe_to_delete` returns the names the server has finished, wrapped as `|name|`. These are
 *presumed* backed up (time-based, not verified), so confirm the cloud before relying on it. A
 second shortcut can build the same names, post them to `/safe_to_delete`, collect the photos whose
-`|name|` appears in the response, and pass them to **Delete Photos**. iOS retains deleted items in
-Recently Deleted for 30 days.
+`|name|` appears in the response, and pass them to **Delete Photos**. The generated **Delete
+Backed-Up Photos** does this over the whole library (no Limit), so run it by hand. iOS asks for
+confirmation and retains deleted items in Recently Deleted for 30 days.
