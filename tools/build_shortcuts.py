@@ -108,18 +108,22 @@ class Builder:
     def repeat_each(self, ref):
         return self.block("repeat.each", {"WFInput": attach(ref)})
 
+    def _if(self, ref, condition, **extra):
+        """If block. The condition is written in both the legacy single-condition keys and the
+        newer WFConditions table (iOS 16+); each iOS version reads the form it knows."""
+        cond = dict({"WFCondition": condition,
+                     "WFInput": {"Type": "Variable", "Variable": attach(ref)}}, **extra)
+        return self.block("conditional", dict(cond, WFConditions={
+            "Value": {"WFActionParameterFilterPrefix": 1,
+                      "WFActionParameterFilterTemplates": [cond]},
+            "WFSerializationType": "WFContentPredicateTableTemplate",
+        }))
+
     def if_contains(self, haystack_ref, needle_ref):
-        return self.block("conditional", {
-            "WFCondition": 99,  # contains
-            "WFInput": {"Type": "Variable", "Variable": attach(haystack_ref)},
-            "WFConditionalActionString": text(needle_ref),
-        })
+        return self._if(haystack_ref, 99, WFConditionalActionString=text(needle_ref))  # contains
 
     def if_has_value(self, ref):
-        return self.block("conditional", {
-            "WFCondition": 100,  # has any value
-            "WFInput": {"Type": "Variable", "Variable": attach(ref)},
-        })
+        return self._if(ref, 100)  # has any value
 
     def put(self, url_parts, body_ref):
         return self.add("downloadurl", {
