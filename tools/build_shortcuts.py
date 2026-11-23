@@ -11,7 +11,7 @@ iOS only imports signed shortcuts, so sign each file on a Mac signed into your A
 then AirDrop the signed file to the iPhone. On import, Shortcuts asks for the server
 address and token; neither is stored in these files.
 
-Both shortcuts name each photo `[Name]_[File Size]`, exactly as docs/iphone-shortcut.md
+Both shortcuts name each photo `[Name]_[yyyyMMdd_HHmmss creation date]`, exactly as docs/iphone-shortcut.md
 describes, so they agree with a hand-built client and with each other.
 """
 
@@ -99,11 +99,14 @@ class Builder:
                                                "WFInput": attach(ref)})
 
     def photo_key(self, *wrap):
-        """Text action holding `[Name]_[File Size]` for the current Repeat Item."""
+        """Text action holding `[Name]_[yyyyMMdd_HHmmss]` for the current Repeat Item."""
         name = self.detail("Name", var("Repeat Item"))
-        size = self.detail("File Size", var("Repeat Item"))
+        created = self.detail("Creation Date", var("Repeat Item"))
+        stamp = self.add("format.date", {"WFDateFormatStyle": "Custom",
+                                         "WFDateFormat": "yyyyMMdd_HHmmss",
+                                         "WFDate": text(out(created, "Creation Date"))})
         prefix, suffix = (wrap or ("", ""))
-        return self.text(prefix, out(name, "Name"), "_", out(size, "File Size"), suffix)
+        return self.text(prefix, out(name, "Name"), "_", out(stamp, "Formatted Date"), suffix)
 
     def block(self, ident, start_params):
         """Start a control-flow block; returns a function that closes it."""

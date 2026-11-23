@@ -26,29 +26,33 @@ Create a shortcut named **Send to Pixel**.
    **Oldest First**; Limit off.
 4. **Repeat with Each** (Photos):
    - **Get Details of Images** → **Name**
-   - **Get Details of Images** → **File Size**
-   - **Text** → `[Name]_[File Size]`
+   - **Get Details of Images** → **Creation Date**
+   - **Format Date** → that date, Format **Custom** `yyyyMMdd_HHmmss`
+   - **Text** → `[Name]_[Formatted Date]`
    - **Add to Variable** `NameList`
 5. **Combine Text** → `NameList`, separated by **New Lines**
 6. **Get Contents of URL** → `[Base]/missing`
-   - Method **PUT**; Header `X-Token` = `[Token]`; Request Body **Text** = the combined text
+   - Method **PUT**; Header `X-Token` = `[Token]`; Request Body **File** = the combined text
 7. **Set Variable** `Missing` = Contents of URL
-8. **Split Text** → `Missing` by **New Lines** → **Set Variable** `MissingList`
-9. **If** `Missing` **is** `NONE` → **Stop This Shortcut**
 
 ### Pass 2 — upload the missing items
 
-10. **Repeat with Each** — set the input to the **Find Photos** result from step 3:
+8. **Repeat with Each** — set the input to the **Find Photos** result from step 3:
     - **Get Details of Images** → **Name**
-    - **Get Details of Images** → **File Size**
-    - **Text** → `[Name]_[File Size]`
-    - **If** `MissingList` **contains** that **Text**:
+    - **Get Details of Images** → **Creation Date**
+    - **Format Date** → that date, Format **Custom** `yyyyMMdd_HHmmss`
+    - **Text** → `[Name]_[Formatted Date]`
+    - **If** `Missing` **contains** that **Text**:
       - **URL Encode** that **Text**
       - **Get Contents of URL** → `[Base]/upload?name=[URL Encoded Text]`
         - Method **PUT**; Header `X-Token` = `[Token]`; Request Body **File** = **Repeat Item**
 
-Match against `MissingList` (the split list), not the raw `Missing` text — a raw-text "contains"
-can match one name inside a longer one (for example `_100000` within `_1000000`).
+A "contains" match can occasionally hit one name inside a longer one. That only causes an extra
+upload, which the server answers with `skipped`. When nothing is missing the response is `NONE`
+and pass 2 uploads nothing.
+
+`tools/build_shortcuts.py` generates this shortcut (and the deletion one below) as files; see its
+header for how to sign and import them.
 
 ## Automation
 
@@ -61,8 +65,13 @@ with the device on power.
 
 ## Naming
 
-`Name_FileSize` is stable per asset (so re-runs are idempotent) and collides only if two assets
-share both a filename and an exact byte size. Prepend the creation date for additional certainty.
+`Name_yyyyMMdd_HHmmss` (e.g. `IMG_1234_20261123_142501`) is stable per asset, so re-runs are
+idempotent. The filename alone is not enough: the camera counter wraps after `IMG_9999`, and a
+repeated name would be skipped as already done and later reported as safe to delete. Two assets
+collide only if they share both a filename and the second they were taken.
+
+The date is formatted in the phone's current time zone, so after travelling an older photo may get
+a new name and be uploaded once more. That costs bandwidth, never a photo.
 
 ## Deleting originals after backup (optional)
 

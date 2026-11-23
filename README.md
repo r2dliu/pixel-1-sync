@@ -110,7 +110,7 @@ All endpoints except `/ping` require the `X-Token` header. The `PUT` endpoints a
 | `PUT /upload?name=<n>` | file bytes | `saved` / `skipped` / `BUSY`; `413` if larger than the buffer, `415` if not a recognized photo or video |
 
 A typical client first posts the batch of candidate names to `/missing`, then `PUT`s only the
-returned files to `/upload`, naming each one stably (for example `creationDate_fileSize`) so
+returned files to `/upload`, naming each one stably (for example `IMG_1234_20261123_142501`, filename plus creation time) so
 re-runs are idempotent. Names are compared by *identity*: sanitized, with any known media
 extension removed, so `IMG_1.HEIC` and `IMG_1` refer to the same item. The server appends every completed name to a ledger, so files that have
 been backed up and removed are never requested again.
